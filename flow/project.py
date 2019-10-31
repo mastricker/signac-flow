@@ -923,70 +923,6 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
         for cls in type(self).__mro__:
             self._label_functions.update(getattr(cls, '_LABEL_FUNCTIONS', dict()))
 
-    """Decorator to add a pre-condition function for an operation function.
-
-    Use a label function (or any function of :code:`job`) as a condition:
-
-    .. code-block:: python
-
-        @FlowProject.label
-        def some_label(job):
-            return job.doc.ready == True
-
-        @FlowProject.operation
-        @FlowProject.pre(some_label)
-        def some_operation(job):
-            pass
-
-    Use a :code:`lambda` function of :code:`job` to create custom conditions:
-
-    .. code-block:: python
-
-        @FlowProject.operation
-        @FlowProject.pre(lambda job: job.doc.ready == True)
-        def some_operation(job):
-            pass
-
-    Use the post-conditions of an operation as a pre-condition for another operation:
-
-    .. code-block:: python
-
-        @FlowProject.operation
-        @FlowProject.post(lambda job: job.isfile('output.txt'))
-        def previous_operation(job):
-            pass
-
-        @FlowProject.operation
-        @FlowProject.pre.after(previous_operation)
-        def some_operation(job):
-            pass
-    """
-
-    """Decorator to add a post-condition function for an operation function.
-
-    Use a label function (or any function of :code:`job`) as a condition:
-
-    .. code-block:: python
-
-        @FlowProject.label
-        def some_label(job):
-            return job.doc.finished == True
-
-        @FlowProject.operation
-        @FlowProject.post(some_label)
-        def some_operation(job):
-            pass
-
-    Use a :code:`lambda` function of :code:`job` to create custom conditions:
-
-    .. code-block:: python
-
-        @FlowProject.operation
-        @FlowProject.post(lambda job: job.doc.finished == True)
-        def some_operation(job):
-            pass
-    """
-
     ALIASES = dict(
         unknown='U',
         registered='R',
@@ -1743,7 +1679,7 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
                 if pretend:
                     print(operation.cmd)
                 else:
-                    self._fork(operation, timeout)
+                    self._execute_operation(operation, timeout)
         else:
             logger.debug("Parallelized execution of {} operation(s).".format(len(operations)))
             with contextlib.closing(Pool(processes=cpu_count() if np < 0 else np)) as pool:
@@ -1801,21 +1737,36 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
         except Exception as error:  # Masking all errors since they must be pickling related.
             raise self._PickleError(error)
 
-        results = [pool.apply_async(_fork_with_serialization, task) for task in s_tasks]
+        results = [pool.apply_async(_execute_serialized_operation, task) for task in s_tasks]
 
         for result in tqdm(results) if progress else results:
             result.get(timeout=timeout)
 
-    def _fork(self, operation, timeout=None):
+    def _execute_operation(self, operation, timeout=None):
         logger.info("Execute operation '{}'...".format(operation))
 
-        # Execute without forking if possible...
-        if timeout is None and operation.name in self._operation_functions and \
-                operation.directives.get('executable', sys.executable) == sys.executable:
-            logger.debug("Able to optimize execution of operation '{}'.".format(operation))
+        # Check if we need to fork for operation execution...
+        if (
+            # The 'fork' directive was provided and evaluates to True:
+            operation.directives.get('fork', False)
+            # Separate process needed to cancel with timeout:
+            or timeout is not None
+            # The operation function is not registered with the class:
+            or operation.name not in self._operation_functions
+            # The specified executable is not the same as the interpreter instance:
+            or operation.directives.get('executable', sys.executable) != sys.executable
+        ):
+            # ... need to fork:
+            logger.debug(
+                "Forking to execute operation '{}' with "
+                "cmd '{}'.".format(operation, operation.cmd))
+            subprocess.run(operation.cmd, shell=True, timeout=timeout, check=True)
+        else:
+            # ... executing operation in interpreter process as function:
+            logger.debug(
+                "Executing operation '{}' with current interpreter "
+                "process ({}).".format(operation, os.getpid()))
             self._operation_functions[operation.name](operation.job)
-        else:   # need to fork
-            subprocess.call(operation.cmd, shell=True, timeout=timeout)
 
     def run(self, jobs=None, names=None, pretend=False, np=None, timeout=None, num=None,
             num_passes=1, progress=False, order=None):
@@ -2200,7 +2151,9 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
             # engine and warn about those that have not been.
             keys_unused = {
                 key for op in operations for key in
-                op.directives._keys_set_by_user.difference(op.directives.keys_used)}
+                op.directives._keys_set_by_user.difference(op.directives.keys_used)
+                if key not in ('fork', )  # whitelist
+            }
             if keys_unused:
                 logger.warning(
                     "Some of the keys provided as part of the directives were not used by "
@@ -3024,7 +2977,7 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
 
                 def operation_function(job):
                     cmd = operation(job).format(job=job)
-                    subprocess.call(cmd, shell=True)
+                    subprocess.run(cmd, shell=True, check=True)
 
         except KeyError:
             raise KeyError("Unknown operation '{}'.".format(args.operation))
@@ -3294,10 +3247,10 @@ class FlowProject(signac.contrib.Project, metaclass=_FlowProjectClass):
             _exit_or_raise()
 
 
-def _fork_with_serialization(loads, project, operation):
-    """Invoke the _fork() method on a serialized project instance."""
+def _execute_serialized_operation(loads, project, operation):
+    """Invoke the _execute_operation() method on a serialized project instance."""
     project = loads(project)
-    project._fork(project._loads_op(operation))
+    project._execute_operation(project._loads_op(operation))
 
 
 ###
